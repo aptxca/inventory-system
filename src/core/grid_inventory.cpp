@@ -80,9 +80,15 @@ void GridInventory::set_size(const Vector2i &new_size) {
 		return;
 	Vector2i old_size = size;
 	size = new_size;
-	if (size.x > 64 || size.y > 64) {
-		UtilityFunctions::printerr("GridInventory size is too large, it should not exceed 64x64.");
-		size = Vector2i(64, 64);
+	// 只钳越界的那一维。上游写法是超限时把 size 整个重置成 (64, 64)，
+	// 列超限会把行数一起打回，是个附带 bug。
+	if (size.x > MAX_COLUMNS) {
+		UtilityFunctions::printerr("GridInventory columns are too large, they should not exceed ", MAX_COLUMNS, ".");
+		size.x = MAX_COLUMNS;
+	}
+	if (size.y > MAX_ROWS) {
+		UtilityFunctions::printerr("GridInventory rows are too large, they should not exceed ", MAX_ROWS, ".");
+		size.y = MAX_ROWS;
 	}
 	if (!Engine::get_singleton()->is_editor_hint()) {
 		if (_bounds_broken())

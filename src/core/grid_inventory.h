@@ -33,6 +33,11 @@ protected:
 public:
 	virtual void _enter_tree() override;
 	const Vector2i DEFAULT_SIZE = Vector2i(8, 8);
+
+	// 项目定制：上游把两个维度硬钳在 64×64，仓库等级涨上去必撞墙。
+	// 改为列、行各自设限；行数放宽到 1024，探索收集类游戏需要能长大的仓库。
+	static constexpr int MAX_COLUMNS = 64;
+	static constexpr int MAX_ROWS = 1024;
 	GridInventory();
 	~GridInventory();
 	void set_size(const Vector2i &new_size);
