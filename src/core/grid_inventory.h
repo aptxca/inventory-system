@@ -71,6 +71,9 @@ public:
 	bool rect_free(const Rect2i &rect, const Ref<ItemStack> &exception = nullptr) const;
 	Vector2i find_free_place(const Vector2i stack_size, const String item_id, const int amount, const Dictionary properties, const bool is_rotated, const Ref<ItemStack> &exception = nullptr) const;
 	bool has_free_place(const Vector2i stack_size, const Ref<ItemStack> &exception = nullptr) const;
+	// 自动整理：按占格面积降序、左上优先 first-fit 逐个落位；某件在原朝向放不下时
+	// 才旋转 90°。只挪位置与旋转，不动 stacks 顺序与堆叠内容。
+	// 全部落位成功返回 true；任一件放不下则整体回滚并返回 false。
 	bool sort();
 	virtual Dictionary serialize() const override;
 	virtual void deserialize(const Dictionary data) override;

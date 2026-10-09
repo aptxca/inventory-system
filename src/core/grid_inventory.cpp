@@ -1,6 +1,8 @@
 #include "grid_inventory.h"
+#include <algorithm>
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
+#include <vector>
 
 void GridInventory::_enter_tree() {
 	_refresh_quad_tree();
@@ -440,26 +442,129 @@ bool GridInventory::has_free_place(const Vector2i stack_size, const Ref<ItemStac
 	return false;
 }
 
+namespace {
+// GridInventory::sort() 的落位条目：缓存尺寸，避免排序与装箱过程中反复查表。
+struct GridSortEntry {
+	Ref<ItemStack> stack;
+	int index = 0;
+	Vector2i base_size; // 定义里的原始尺寸（未旋转）
+	Vector2i pack_size; // 快照时的实际占格（已含当时的旋转）
+	Vector2i old_position;
+	bool old_rotation = false;
+	bool packable = false; // 尺寸合法、参与装箱；否则原地不动
+};
+} // namespace
+
+// 项目定制：上游把 sort() 留成了空实现（函数体整段注释掉、无条件 return true），
+// 这里补成「面积降序 + 左上优先 first-fit + 旋转回退」的自动归拢。
+//
+// 保持不变：stacks 数组顺序、每件的 item_id / amount / properties。
+// 会改变：stack_positions（位置）与 stack_rotations（旋转）。
+// 故意不发 stack_added / stack_removed —— UI 的 _stack_uis 与 stacks 按下标平行，
+// 整理只挪位置、不增删堆叠，发这两个信号会让 UI 错位。改用 _flag_contents_changed，
+// 由 Inventory::_process 统一发 contents_changed（与 move_stack_to 同一路径）。
 bool GridInventory::sort() {
-	// TypedArray<ItemStack> stack_array;
-	// for (size_t i = 0; i < stacks.size(); i++) {
-	// 	Ref<ItemStack> stack = stacks[i];
-	// 	stack_array.append(stack);
-	// 	stack_array.sort_custom(callable_mp(this, &GridInventory::_compare_stacks));
-	// }
+	ERR_FAIL_NULL_V_MSG(quad_tree, false, "'quad_tree' is null.");
+	ERR_FAIL_NULL_V_MSG(get_database(), false, "'database' is null.");
 
-	// for (size_t i = 0; i < stack_array.size(); i++) {
-	// 	Ref<ItemStack> stack = stack_array[i];
-	// 	_move_stack_to_unsafe(stack, -get_stack_size(stack));
-	// }
+	const int count = (int)stacks.size();
+	if (count == 0)
+		return true;
 
-	// for (size_t i = 0; i < stack_array.size(); i++) {
-	// 	Ref<ItemStack> stack = stack_array[i];
-	// 	Vector2i free_place = find_free_place(get_stack_size(stack), stack->get_item_id(), stack->get_amount(), stack->get_properties());
-	// 	if (free_place == Vector2i(-1, -1))
-	// 		return false;
-	// 	move_stack_to(stack, free_place);
-	// }
+	// 1) 快照：原位置、原旋转、原始尺寸。
+	std::vector<GridSortEntry> entries;
+	entries.reserve(count);
+	for (int i = 0; i < count; i++) {
+		GridSortEntry entry;
+		entry.stack = stacks[i];
+		entry.index = i;
+		if (entry.stack != nullptr) {
+			entry.old_position = get_stack_position(entry.stack);
+			entry.old_rotation = is_stack_rotated(entry.stack);
+			Ref<ItemDefinition> definition = get_database()->get_item(entry.stack->get_item_id());
+			if (definition != nullptr) {
+				entry.base_size = definition->get_size();
+				entry.pack_size = entry.old_rotation ? definition->get_rotated_size() : entry.base_size;
+				entry.packable = entry.base_size.x > 0 && entry.base_size.y > 0;
+			}
+		}
+		// 取不到定义 / 空 stack：当作不可移动的障碍物——保留原位、重新登记，不参与装箱。
+		// 若把它们也拿去装箱，一件坏数据就会让整个整理永远失败。
+		entries.push_back(entry);
+	}
+
+	// 2) 装箱顺序：面积降序；面积相同按原下标升序，保证同一布局重复整理结果一致。
+	std::vector<int> order;
+	order.reserve(count);
+	for (int i = 0; i < count; i++) {
+		if (entries[i].packable)
+			order.push_back(i);
+	}
+	std::sort(order.begin(), order.end(), [&entries](const int left, const int right) {
+		const int area_left = entries[left].pack_size.x * entries[left].pack_size.y;
+		const int area_right = entries[right].pack_size.x * entries[right].pack_size.y;
+		if (area_left != area_right)
+			return area_left > area_right;
+		return left < right;
+	});
+
+	// 3) 重建空间索引，障碍物按原位登记。
+	// 不沿用上游注释稿「先把堆叠挪到负坐标」的做法：quad_tree 会静默丢弃越界矩形，
+	// 而且首个越界矩形会被收进根节点，依赖这种行为太脆。直接重建最省心。
+	Ref<QuadTree> rebuilt_quad_tree = memnew(QuadTree());
+	rebuilt_quad_tree->init(size);
+	quad_tree = rebuilt_quad_tree;
+	for (int i = 0; i < count; i++) {
+		if (!entries[i].packable && entries[i].stack != nullptr)
+			quad_tree->add(Rect2i(entries[i].old_position, entries[i].pack_size), entries[i].stack);
+	}
+
+	// 4) 逐个落位：先试未旋转朝向，整块网格放不下再试旋转朝向。
+	// find_free_place 是行优先扫描（y 外层、x 内层），天然左上优先；它同时会走
+	// GridInventoryConstraint，所以整理不会违反网格约束。
+	bool packed_all = true;
+	for (size_t k = 0; k < order.size(); k++) {
+		GridSortEntry &entry = entries[order[k]];
+		const String item_id = entry.stack->get_item_id();
+		const int amount = entry.stack->get_amount();
+		const Dictionary properties = entry.stack->get_properties();
+
+		bool rotation = false;
+		Vector2i place = find_free_place(entry.base_size, item_id, amount, properties, false);
+		if (place == Vector2i(-1, -1) && entry.base_size.x != entry.base_size.y) {
+			// 正方形物品的旋转是恒等变换，跳过以省一次全网格扫描。
+			place = find_free_place(entry.base_size, item_id, amount, properties, true);
+			rotation = place != Vector2i(-1, -1);
+		}
+		if (place == Vector2i(-1, -1)) {
+			packed_all = false;
+			break;
+		}
+
+		const Vector2i packed_size = rotation ? Vector2i(entry.base_size.y, entry.base_size.x) : entry.base_size;
+		stack_positions[entry.index] = place;
+		stack_rotations[entry.index] = rotation;
+		quad_tree->add(Rect2i(place, packed_size), entry.stack);
+	}
+
+	// 5) 任一件放不下就整体回滚。按原下标、原位置、原旋转原样重建必然自洽，
+	//    所以库存绝不会停在半整理状态。注意这里用的是快照里的 pack_size——
+	//    上面落位时没有就地改写它。
+	if (!packed_all) {
+		Ref<QuadTree> restored_quad_tree = memnew(QuadTree());
+		restored_quad_tree->init(size);
+		quad_tree = restored_quad_tree;
+		for (int i = 0; i < count; i++) {
+			if (entries[i].stack == nullptr)
+				continue;
+			stack_positions[entries[i].index] = entries[i].old_position;
+			stack_rotations[entries[i].index] = entries[i].old_rotation;
+			quad_tree->add(Rect2i(entries[i].old_position, entries[i].pack_size), entries[i].stack);
+		}
+		return false;
+	}
+
+	_flag_contents_changed = true; // 由 Inventory::_process 统一发 contents_changed
 	return true;
 }
 
@@ -582,6 +687,9 @@ void GridInventory::_move_stack_to_unsafe(const Ref<ItemStack> &stack, const Vec
 	quad_tree->add(get_stack_rect(stack), stack);
 }
 
+// 上游留下的半成品：本函数（连同 _is_sorted / _move_stack_to_unsafe / _sort_if_needed）
+// 未绑定到 ClassDB、也没有任何调用点。它只按面积降序、没有同面积 tiebreak，直接拿来做
+// sort() 的比较器会让结果不确定（同面积物品的相对次序随排序算法而变），所以 sort() 自己排序。
 bool GridInventory::_compare_stacks(const Ref<ItemStack> &stack1, const Ref<ItemStack> &stack2) const {
 	Rect2i rect1 = Rect2i(get_stack_position(stack1), get_stack_size(stack1));
 	Rect2i rect2 = Rect2i(get_stack_position(stack2), get_stack_size(stack2));
